@@ -1,19 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// HukamBook Live Odds Backend — Multi-Provider Edition
+// HukamBook Live Odds Backend — Multi-Provider Edition (v2.3)
 // Zero-dependency Node.js server (Node 18+ required — uses built-in fetch)
 //
 // What it does:
-//   • Fetches REAL matches, live scores and REAL odds from multiple providers:
-//     1. Stake (Primary) — GraphQL API, no auth needed
-//     2. ReddyBook (Fallback) — REST API with guest endpoints
-//   • No API key required for primary source (Stake)
+//   • Fetches REAL matches, live scores and REAL odds from multiple providers
+//   • No API key required for any source
 //   • Smart fallback chain + intelligent caching
 //   • Serves everything in the exact schema the HukamBook frontend expects
 //
-// Providers:
-//   • Stake: https://stake.com/_api/graphql (working, no auth)
-//   • ReddyBook Primary: https://api.dcric99.com (needs proxy/allowed IP)
-//   • ReddyBook Fallback: https://v9.jarvisexch.com (working but stale data)
+// Providers (fallback order — clean team/odds data first):
+//   1. Stake     — https://stake.com/_api/graphql (real teams + real odds)
+//   2. SofaScore — real teams + real live scores (needs Chrome-like UA)
+//   3. Reddy66   — BetFair odds via Robuzz (needs allowed IP)
+//   4. ReddyBook — guest events + /ws odds & scores (primary needs allowed IP)
+//   5. LiveScore — score-only, last resort
+//   (FanCode removed in v2.3 — it returned broadcast/streaming metadata, not
+//    clean team-vs-team match data, so cards showed feed names instead of teams.)
 //
 // Endpoints:
 //   GET /api/matches   → array of matches in HukamBook format
@@ -102,7 +104,7 @@ const liq = (seedStr, i) => {
 };
 
 // ── Honest odds markers ──────────────────────────────────────────────────────
-// Providers that are pure SCORE/DATA feeds (FanCode, SofaScore, LiveScore) do
+// Providers that are pure SCORE/DATA feeds (SofaScore, LiveScore) do
 // NOT publish betting odds. Rather than invent fake prices, we return this
 // explicit "unavailable" shape. The frontend can render it as "—" or hide the
 // odds column. `oddsAvailable: false` on the match tells the UI odds are absent.
@@ -196,64 +198,6 @@ async function fetchFromStake() {
     return matches;
   } catch (e) {
     cache.providerHealth.stake = { ok: false, error: String(e.message), timestamp: Date.now() };
-    throw e;
-  }
-}
-
-// ── Provider: FanCode (GraphQL) ──────────────────────────────────────────────
-async function fetchFromFanCode() {
-  const query = `query LiveNowMatches($limit: Int) {
-    liveNowMatches(limit: $limit) {
-      edges {
-        topMatches {
-          id
-          tour { name slug }
-          status { status streamingStatus }
-          match { name teams { name logo } }
-        }
-      }
-    }
-  }`;
-  
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    
-    const res = await fetch("https://www.fancode.com/graphql", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "HukamBook/2.0",
-      },
-      body: JSON.stringify({ 
-        query,
-        variables: { limit: 12 }
-      }),
-      signal: controller.signal,
-    });
-    
-    clearTimeout(timeout);
-    
-    if (!res.ok) throw new Error(`FanCode HTTP ${res.status}`);
-    const data = await res.json();
-    
-    if (data.errors) throw new Error(`FanCode GraphQL: ${data.errors.map(e => e.message).join(", ")}`);
-    
-    const matches = [];
-    const edges = data.data?.liveNowMatches?.edges || [];
-    
-    for (const edge of edges) {
-      for (const match of edge.topMatches || []) {
-        const hukamMatch = fancodeMatchToHukamMatch(match);
-        if (hukamMatch) matches.push(hukamMatch);
-      }
-    }
-    
-    cache.providerHealth.fancode = { ok: true, timestamp: Date.now(), matchCount: matches.length };
-    return matches;
-  } catch (e) {
-    cache.providerHealth.fancode = { ok: false, error: String(e.message), timestamp: Date.now() };
     throw e;
   }
 }
@@ -702,60 +646,6 @@ function applyCricketScore(match, row) {
   if (as != null) { match.teamB.score = as; match.teamB.overs = (away.overs ?? away.ov ?? "") + ""; }
 }
 
-// ── Transform: FanCode match → HukamBook match ──────────────────────────────
-function fancodeMatchToHukamMatch(match) {
-  const isLive = match.status?.status === "LIVE" || match.status?.streamingStatus === "STARTED";
-  if (match.status?.status === "COMPLETED") return null;
-  
-  // FanCode covers cricket, football, basketball, kabaddi, hockey, tennis, F1.
-  // Derive sport from the tour/sport slug rather than assuming cricket.
-  const slug = (match.tour?.slug || match.sport?.slug || "").toLowerCase();
-  const sport = slug.includes("football") || slug.includes("soccer") ? "football"
-    : slug.includes("tennis") ? "tennis"
-    : slug.includes("basketball") ? "basketball"
-    : slug.includes("kabaddi") ? "kabaddi"
-    : slug.includes("hockey") ? "hockey"
-    : "cricket";
-  
-  const teams = match.match?.teams || [];
-  const teamA = teams[0]?.name || "Team A";
-  const teamB = teams[1]?.name || "Team B";
-  
-  return {
-    id: match.id,
-    sport,
-    league: `${match.tour?.name || "FanCode"} • ${isLive ? "LIVE" : "Upcoming"}`,
-    teamA: {
-      name: teamA,
-      short: shortName(teamA),
-      flag: flagFor(teamA, sport),
-      score: isLive ? "In progress" : "—",
-      overs: "",
-    },
-    teamB: {
-      name: teamB,
-      short: shortName(teamB),
-      flag: flagFor(teamB, sport),
-      score: isLive ? "" : "—",
-      overs: "",
-    },
-    status: isLive ? "live" : "upcoming",
-    time: isLive ? "Live now" : istTime(new Date().toISOString()),
-    info: isLive ? "🔴 Match in progress" : `On FanCode`,
-    // FanCode is a STREAMING/SCORE feed — it does not publish betting odds.
-    // We mark odds unavailable rather than inventing prices.
-    oddsAvailable: false,
-    back: NO_ODDS,
-    lay: NO_ODDS,
-    backB: NO_ODDS,
-    layB: NO_ODDS,
-    draw: null,
-    markets: 0,
-    fancy: [],
-    provider: "FanCode",
-  };
-}
-
 // ── Transform: SofaScore event → HukamBook match ─────────────────────────────
 function sofascoreEventToHukamMatch(event, sport) {
   const isLive = event.status?.type === "inprogress" || event.status?.type === "live";
@@ -975,13 +865,21 @@ async function refreshCache() {
   if (cache.refreshing) return cache.refreshing;
   
   cache.refreshing = (async () => {
+    // Order matters: providers that return clean team-vs-team data WITH real
+    // odds come first, then real-score providers, then score-only as last resort.
+    //   1. Stake     — real teams + real decimal odds (same call) → best for a board
+    //   2. SofaScore — real teams + real live scores, correct sport detection
+    //   3. Reddy66   — real teams + real BetFair odds (when IP allows)
+    //   4. ReddyBook — real teams + real odds/scores (when reachable)
+    //   5. LiveScore — real teams, score-only, last resort
+    // (FanCode removed: it returns streaming/broadcast metadata — feed names,
+    //  venues, "Day 2" — not clean team-vs-team match data, so it looked wrong.)
     const providers = [
       { name: "Stake", fetch: fetchFromStake },
-      { name: "FanCode", fetch: fetchFromFanCode },
       { name: "SofaScore", fetch: fetchFromSofaScore },
-      { name: "LiveScore", fetch: fetchFromLiveScore },
       { name: "Reddy66", fetch: fetchFromReddy66 },
       { name: "ReddyBook", fetch: fetchFromReddyBook },
+      { name: "LiveScore", fetch: fetchFromLiveScore },
     ];
     
     let matches = [];
@@ -1084,16 +982,15 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(CFG.PORT, () => {
   console.log("═══════════════════════════════════════════════════════════════");
-  console.log(`HukamBook Backend v2 (6-Provider Multi-Source) on http://localhost:${CFG.PORT}`);
+  console.log(`HukamBook Backend v2.3 (5-Provider Multi-Source) on http://localhost:${CFG.PORT}`);
   console.log("═══════════════════════════════════════════════════════════════");
   console.log("Provider Fallback Chain (in order):");
   console.log(`  1. Stake (GraphQL) — ${CFG.STAKE_API}`);
-  console.log(`  2. FanCode (GraphQL) — https://www.fancode.com/graphql`);
-  console.log(`  3. SofaScore (REST) — https://api.sofascore.com/api/v1/sport/{sport}/events/live`);
-  console.log(`  4. LiveScore (REST) — https://prod-cdn-public-api.livescore.com/v1/api/app/live/{sport}/0`);
-  console.log(`  5. Reddy66 (REST) — https://catalog.robuzz.lol/catalog/v2/sports-feed/sports/live-events`);
-  console.log(`  6. ReddyBook (REST) → ${CFG.REDDYBOOK_PRIMARY}`);
+  console.log(`  2. SofaScore (REST) — https://api.sofascore.com/api/v1/sport/{sport}/events/live`);
+  console.log(`  3. Reddy66 (REST) — https://catalog.robuzz.lol/catalog/v2/sports-feed/sports/live-events`);
+  console.log(`  4. ReddyBook (REST) → ${CFG.REDDYBOOK_PRIMARY}`);
   console.log(`     Fallback → ${CFG.REDDYBOOK_FALLBACK}`);
+  console.log(`  5. LiveScore (REST) — https://prod-cdn-public-api.livescore.com/v1/api/app/live/{sport}/0`);
   console.log(`Cache TTL: ${CFG.CACHE_TTL_S}s (${CFG.LIVE_CACHE_TTL_S}s live)`);
   console.log("Endpoints:");
   console.log(`  GET /api/matches → matches array`);
