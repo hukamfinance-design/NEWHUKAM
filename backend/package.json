@@ -1,0 +1,8 @@
+{
+  "name": "hukambook-backend",
+  "version": "2.2.0",
+  "private": true,
+  "description": "HukamBook live sports backend — 6-provider, key-free (Stake, FanCode, SofaScore, LiveScore, Reddy66, ReddyBook)",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js" }
+}
