@@ -40,25 +40,63 @@ try {
 // ── Configuration ────────────────────────────────────────────────────────────
 const CFG = {
   PORT: +(process.env.PORT || 8787),
-  
-  // ── Primary Provider: Stake (No auth needed, working) ──
+
+  // ── ESPN (keyless, cloud-friendly) — football/tennis odds + all scores ──
+  // No config needed. These public endpoints work from any host (incl. Render).
+
+  // ── the-odds-api.com key rotation (real cricket odds, works from any IP) ──
+  // Add one or more keys, comma-separated, in the ODDS_API_KEYS env var.
+  // e.g. ODDS_API_KEYS=abc123,def456,ghi789
+  // Rotation auto-advances to the next key when one hits its monthly quota.
+  ODDS_API_KEYS: (process.env.ODDS_API_KEYS || process.env.ODDS_KEY || "")
+    .split(",").map(s => s.trim()).filter(Boolean),
+  ODDS_API_BASE: "https://api.the-odds-api.com",
+  ODDS_CACHE_TTL_S: +(process.env.ODDS_CACHE_TTL_SECONDS || 900), // 15 min — makes keys last
+
+  // ── Exchange providers (bonus attempts; usually IP-blocked from cloud) ──
   STAKE_API: "https://stake.com/_api/graphql",
-  
-  // ── Fallback: ReddyBook (Guest endpoints, no auth) ──
   REDDYBOOK_PRIMARY: process.env.REDDYBOOK_PRIMARY || "https://api.dcric99.com",
   REDDYBOOK_FALLBACK: process.env.REDDYBOOK_FALLBACK || "https://v9.jarvisexch.com",
-  
-  // ── Optional proxy for if you have allowed IP ──
   PROXY_URL: process.env.PROXY_URL || null,
-  
+
   // ── Cache & refresh settings ──
   CACHE_TTL_S: +(process.env.CACHE_TTL_SECONDS || 60),
   LIVE_CACHE_TTL_S: +(process.env.LIVE_CACHE_TTL_SECONDS || 30),
   ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN || "*",
-  
+
   // ── Sports to show (can be empty; providers determine availability) ──
   SPORT_KEYS: (process.env.SPORT_KEYS || "").split(",").map(s => s.trim()).filter(Boolean),
 };
+
+// ── Odds API key-rotation state ─────────────────────────────────────────────
+const oddsKeyState = {
+  idx: 0,                      // which key we're currently using
+  exhausted: new Set(),        // keys that returned 401/429 (quota done)
+  lastReset: Date.now(),
+};
+// Return the current usable key, skipping exhausted ones. Null if all are spent.
+function currentOddsKey() {
+  // Monthly-ish reset: clear the exhausted set every 24h so keys get retried
+  // (quotas are monthly, but this cheaply recovers from transient 429s too).
+  if (Date.now() - oddsKeyState.lastReset > 24 * 3600 * 1000) {
+    oddsKeyState.exhausted.clear();
+    oddsKeyState.lastReset = Date.now();
+  }
+  const keys = CFG.ODDS_API_KEYS;
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[(oddsKeyState.idx + i) % keys.length];
+    if (!oddsKeyState.exhausted.has(k)) {
+      oddsKeyState.idx = (oddsKeyState.idx + i) % keys.length;
+      return k;
+    }
+  }
+  return null; // every key exhausted
+}
+// Mark a key spent and advance to the next.
+function markOddsKeyExhausted(key) {
+  oddsKeyState.exhausted.add(key);
+  oddsKeyState.idx = (oddsKeyState.idx + 1) % Math.max(CFG.ODDS_API_KEYS.length, 1);
+}
 
 // ── In-memory cache with provider tracking ──────────────────────────────────
 const cache = {
@@ -133,6 +171,331 @@ const formatSize = (n) => {
 const tick = (o) => o < 2 ? 0.01 : o < 3 ? 0.02 : o < 4 ? 0.05 : o < 6 ? 0.1 : 0.2;
 const layFrom = (backLadder, eventId, tag) =>
   (backLadder || []).map((b, i) => ({ odds: +(b.odds + tick(b.odds) * (i + 1)).toFixed(2), stake: liq(eventId + tag + "L", i) }));
+
+// ── American moneyline → decimal odds ───────────────────────────────────────
+// ESPN publishes odds as American moneylines (e.g. -120, +340). Convert to the
+// decimal format the UI uses. -120 → 1.83, +340 → 4.40.
+function moneylineToDecimal(ml) {
+  const n = Number(ml);
+  if (!isFinite(n) || n === 0) return null;
+  return n > 0 ? +(n / 100 + 1).toFixed(2) : +(100 / Math.abs(n) + 1).toFixed(2);
+}
+
+// ── Provider: ESPN (keyless, cloud-friendly) ────────────────────────────────
+// ESPN's public scoreboard endpoints return real teams, live scores AND, for
+// many football/tennis matches, real bookmaker odds embedded in the feed — all
+// without a key and WITHOUT blocking cloud/VPS IPs. This is the reliable core.
+const ESPN_SOCCER_LEAGUES = {
+  "eng.1": "Premier League", "eng.2": "Championship", "esp.1": "La Liga",
+  "ita.1": "Serie A", "ger.1": "Bundesliga", "fra.1": "Ligue 1",
+  "por.1": "Primeira Liga", "ned.1": "Eredivisie", "usa.1": "MLS",
+  "mex.1": "Liga MX", "bra.1": "Brazil Serie A", "arg.1": "Argentina Primera",
+  "uefa.champions": "Champions League", "uefa.europa": "Europa League",
+  "ind.1": "Indian Super League",
+};
+const ESPN_TENNIS_TOURS = ["atp", "wta"];
+
+async function espnGet(url) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (HukamBook)", "Accept": "application/json" },
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+    if (!res.ok) throw new Error(`ESPN HTTP ${res.status}`);
+    return await res.json();
+  } catch (e) { clearTimeout(t); throw e; }
+}
+
+async function fetchFromESPN() {
+  const tasks = [];
+  // Football leagues
+  for (const [lg, label] of Object.entries(ESPN_SOCCER_LEAGUES)) {
+    tasks.push(
+      espnGet(`https://site.api.espn.com/apis/site/v2/sports/soccer/${lg}/scoreboard`)
+        .then(d => espnParse(d, "football", label))
+        .catch(() => [])
+    );
+  }
+  // Tennis tours
+  for (const tour of ESPN_TENNIS_TOURS) {
+    tasks.push(
+      espnGet(`https://site.api.espn.com/apis/site/v2/sports/tennis/${tour}/scoreboard`)
+        .then(d => espnParse(d, "tennis", tour.toUpperCase()))
+        .catch(() => [])
+    );
+  }
+
+  try {
+    const results = await Promise.all(tasks);
+    const matches = results.flat().filter(Boolean);
+    if (matches.length === 0) throw new Error("no ESPN events");
+    const withOdds = matches.filter(m => m.oddsAvailable).length;
+    cache.providerHealth.espn = { ok: true, timestamp: Date.now(), matchCount: matches.length, withOdds };
+    return matches;
+  } catch (e) {
+    cache.providerHealth.espn = { ok: false, error: String(e.message), timestamp: Date.now() };
+    throw e;
+  }
+}
+
+// Parse one ESPN scoreboard into HukamBook matches, extracting odds when present.
+function espnParse(data, sport, league) {
+  const out = [];
+  for (const ev of data.events || []) {
+    const comp = (ev.competitions || [{}])[0];
+    const competitors = comp.competitors || [];
+    if (competitors.length < 2) continue;
+
+    // ESPN marks home/away explicitly
+    const homeC = competitors.find(c => c.homeAway === "home") || competitors[0];
+    const awayC = competitors.find(c => c.homeAway === "away") || competitors[1];
+    const homeTeam = homeC.team?.displayName || homeC.team?.name || "Home";
+    const awayTeam = awayC.team?.displayName || awayC.team?.name || "Away";
+
+    const state = ev.status?.type?.state; // pre / in / post
+    if (state === "post") continue; // drop finished
+    const isLive = state === "in";
+
+    // ── Extract real odds from ESPN's embedded odds provider ──
+    let homeOdds = null, awayOdds = null, drawOdds = null;
+    const oddsArr = comp.odds || [];
+    if (oddsArr.length) {
+      const o = oddsArr[0]; // first provider (usually the consensus/主 line)
+      homeOdds = moneylineToDecimal(o.homeTeamOdds?.moneyLine);
+      awayOdds = moneylineToDecimal(o.awayTeamOdds?.moneyLine);
+      drawOdds = moneylineToDecimal(o.drawOdds?.moneyLine);
+      // Some feeds only give a text line like "LIV -120"; skip if no moneyline.
+    }
+    const hasOdds = homeOdds != null || awayOdds != null;
+
+    const id = ev.id || `${homeTeam}-${awayTeam}`;
+    const back  = homeOdds != null ? [priceCell(homeOdds, id, "A", 0)] : NO_ODDS;
+    const backB = awayOdds != null ? [priceCell(awayOdds, id, "B", 0)] : NO_ODDS;
+    const draw  = drawOdds != null
+      ? [{ odds: +drawOdds.toFixed(2), stake: liq(String(id) + "D", 0), side: "back" }]
+      : null;
+
+    // Score string per side (ESPN gives per-competitor score)
+    const homeScore = isLive ? (homeC.score ?? "0") : "—";
+    const awayScore = isLive ? (awayC.score ?? "0") : "—";
+
+    out.push({
+      id,
+      sport,
+      league: `${league} • ${isLive ? "LIVE" : "Upcoming"}`,
+      teamA: {
+        name: homeTeam, short: shortName(homeTeam), flag: flagFor(homeTeam, sport),
+        score: homeScore, overs: "",
+      },
+      teamB: {
+        name: awayTeam, short: shortName(awayTeam), flag: flagFor(awayTeam, sport),
+        score: awayScore, overs: "",
+      },
+      status: isLive ? "live" : "upcoming",
+      time: isLive ? (ev.status?.type?.detail || "Live now") : istTime(ev.date),
+      info: isLive ? `🔴 ${ev.status?.type?.detail || "In progress"}` : `Starts ${istTime(ev.date)}`,
+      oddsAvailable: hasOdds,
+      back,
+      lay:  back  ? layFrom(back,  id, "A") : NO_ODDS,
+      backB,
+      layB: backB ? layFrom(backB, id, "B") : NO_ODDS,
+      draw,
+      markets: hasOdds ? 1 : 0,
+      fancy: [],
+      provider: "ESPN",
+    });
+  }
+  return out;
+}
+
+// ── Provider: the-odds-api.com (cricket odds, key rotation) ─────────────────
+// Real bookmaker odds for cricket (and football/tennis) that work from ANY IP.
+// Uses key rotation: burns one key's monthly quota, then advances to the next.
+// Cached 15 min by default so a single free key lasts as long as possible.
+const ODDS_API_GROUPS = { cricket: "Cricket", football: "Soccer", tennis: "Tennis" };
+
+// Cache OddsAPI results separately with a long TTL so we don't spend a request
+// on every 30-60s board refresh — only once per ODDS_CACHE_TTL_S.
+const oddsApiCache = { at: 0, matches: [] };
+
+async function fetchFromOddsAPI() {
+  // Serve cached odds if still fresh — protects the free-key quota.
+  if (oddsApiCache.at && Date.now() - oddsApiCache.at < CFG.ODDS_CACHE_TTL_S * 1000) {
+    if (oddsApiCache.matches.length) return oddsApiCache.matches;
+    throw new Error("odds cached empty"); // nothing last time; don't hammer
+  }
+  const fresh = await fetchFromOddsAPILive();
+  oddsApiCache.at = Date.now();
+  oddsApiCache.matches = fresh;
+  return fresh;
+}
+
+async function fetchFromOddsAPILive() {
+  if (CFG.ODDS_API_KEYS.length === 0) {
+    cache.providerHealth.oddsapi = { ok: false, error: "no keys set (ODDS_API_KEYS)", timestamp: Date.now() };
+    throw new Error("no ODDS_API_KEYS configured");
+  }
+
+  const key = currentOddsKey();
+  if (!key) {
+    cache.providerHealth.oddsapi = { ok: false, error: "all keys exhausted this cycle", timestamp: Date.now() };
+    throw new Error("all Odds API keys exhausted");
+  }
+
+  const oddsGet = async (path, params) => {
+    const usp = new URLSearchParams({ apiKey: key, ...params });
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(`${CFG.ODDS_API_BASE}${path}?${usp}`, {
+        headers: { "Accept": "application/json" }, signal: controller.signal,
+      });
+      clearTimeout(t);
+      // 401 = bad/over-quota key, 429 = rate-limited → mark exhausted, rotate
+      if (res.status === 401 || res.status === 429) {
+        markOddsKeyExhausted(key);
+        throw new Error(`key quota hit (HTTP ${res.status})`);
+      }
+      if (!res.ok) throw new Error(`Odds API HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) { clearTimeout(t); throw e; }
+  };
+
+  try {
+    // Focus on cricket (the thing other providers can't give us). Football/tennis
+    // odds already come from ESPN, so we only spend quota on cricket here.
+    const sportsList = await oddsGet("/v4/sports", {});
+    const cricketKeys = sportsList
+      .filter(s => s.group === "Cricket" && s.active)
+      .map(s => s.key)
+      .slice(0, 3); // cap leagues to limit quota use
+
+    const matches = [];
+    for (const k of cricketKeys) {
+      const data = await oddsGet(`/v4/sports/${k}/odds`, {
+        regions: "eu,uk", markets: "h2h", oddsFormat: "decimal",
+      });
+      for (const ev of data) matches.push(oddsApiEventToHukam(ev, "cricket"));
+    }
+
+    if (matches.length === 0) throw new Error("no cricket odds returned");
+    cache.providerHealth.oddsapi = {
+      ok: true, timestamp: Date.now(), matchCount: matches.length,
+      keyIndex: oddsKeyState.idx, keysTotal: CFG.ODDS_API_KEYS.length,
+      keysExhausted: oddsKeyState.exhausted.size,
+    };
+    return matches;
+  } catch (e) {
+    cache.providerHealth.oddsapi = { ok: false, error: String(e.message), timestamp: Date.now() };
+    throw e;
+  }
+}
+
+// Transform a the-odds-api.com event (decimal odds already) → HukamBook match.
+function oddsApiEventToHukam(ev, sport) {
+  const homeTeam = ev.home_team || "Home";
+  const awayTeam = ev.away_team || "Away";
+  const id = ev.id || `${homeTeam}-${awayTeam}`;
+
+  // Consensus price = median across bookmakers for each outcome.
+  const pricesFor = (teamName) => {
+    const arr = [];
+    for (const b of ev.bookmakers || []) {
+      const mk = (b.markets || []).find(m => m.key === "h2h");
+      const oc = mk && (mk.outcomes || []).find(o => o.name === teamName);
+      if (oc && typeof oc.price === "number") arr.push(oc.price);
+    }
+    if (!arr.length) return null;
+    arr.sort((a, b) => a - b);
+    return arr[Math.floor((arr.length - 1) / 2)]; // median
+  };
+
+  const homeOdds = pricesFor(homeTeam);
+  const awayOdds = pricesFor(awayTeam);
+  const drawOdds = pricesFor("Draw");
+  const hasOdds = homeOdds != null || awayOdds != null;
+
+  const back  = homeOdds != null ? [priceCell(homeOdds, id, "A", 0)] : NO_ODDS;
+  const backB = awayOdds != null ? [priceCell(awayOdds, id, "B", 0)] : NO_ODDS;
+  const draw  = drawOdds != null
+    ? [{ odds: +drawOdds.toFixed(2), stake: liq(String(id) + "D", 0), side: "back" }]
+    : null;
+
+  const started = new Date(ev.commence_time).getTime() <= Date.now();
+
+  return {
+    id, sport,
+    league: `${(ev.sport_title || "Cricket")} • ${started ? "LIVE" : "Upcoming"}`,
+    teamA: {
+      name: homeTeam, short: shortName(homeTeam), flag: flagFor(homeTeam, sport),
+      score: started ? "In progress" : "—", overs: "",
+    },
+    teamB: {
+      name: awayTeam, short: shortName(awayTeam), flag: flagFor(awayTeam, sport),
+      score: started ? "" : "—", overs: "",
+    },
+    status: started ? "live" : "upcoming",
+    time: started ? "Live now" : istTime(ev.commence_time),
+    info: started ? "🔴 Match in progress" : `Starts ${istTime(ev.commence_time)}`,
+    oddsAvailable: hasOdds,
+    back,
+    lay:  back  ? layFrom(back,  id, "A") : NO_ODDS,
+    backB,
+    layB: backB ? layFrom(backB, id, "B") : NO_ODDS,
+    draw,
+    markets: (ev.bookmakers || []).length,
+    fancy: [],
+    provider: "OddsAPI",
+  };
+}
+
+// ── ESPNcricinfo (keyless cricket SCORES) ───────────────────────────────────
+// Cricket odds aren't published by ESPN, but live cricket SCORES are — with real
+// team names, series, and format. Used to enrich/backfill cricket coverage.
+async function fetchFromCricinfo() {
+  try {
+    const data = await espnGet("https://hs-consumer-api.espncricinfo.com/v1/pages/matches/live?lang=en");
+    const matches = [];
+    for (const m of data.matches || []) {
+      const teams = m.teams || [];
+      const nameA = teams[0]?.team?.name || "Team A";
+      const nameB = teams[1]?.team?.name || "Team B";
+      const isLive = m.state === "LIVE";
+      if (m.state === "POST" || m.state === "RESULT") continue;
+
+      const scoreOf = (t) => {
+        const s = t?.score;
+        if (!s) return isLive ? "In progress" : "—";
+        return String(s);
+      };
+
+      const id = String(m.objectId || m.id || `${nameA}-${nameB}`);
+      matches.push({
+        id, sport: "cricket",
+        league: `${(m.series || {}).name || "Cricket"} • ${isLive ? "LIVE" : "Upcoming"}`,
+        teamA: { name: nameA, short: shortName(nameA), flag: flagFor(nameA, "cricket"),
+                 score: scoreOf(teams[0]), overs: "" },
+        teamB: { name: nameB, short: shortName(nameB), flag: flagFor(nameB, "cricket"),
+                 score: scoreOf(teams[1]), overs: "" },
+        status: isLive ? "live" : "upcoming",
+        time: isLive ? "Live now" : (m.startTime ? istTime(m.startTime) : "Upcoming"),
+        info: m.statusText || (isLive ? "🔴 Match in progress" : "Upcoming"),
+        oddsAvailable: false, // cricinfo = scores only (odds come from OddsAPI)
+        back: NO_ODDS, lay: NO_ODDS, backB: NO_ODDS, layB: NO_ODDS, draw: null,
+        markets: 0, fancy: [], provider: "Cricinfo",
+      });
+    }
+    if (matches.length === 0) throw new Error("no live cricket");
+    cache.providerHealth.cricinfo = { ok: true, timestamp: Date.now(), matchCount: matches.length };
+    return matches;
+  } catch (e) {
+    cache.providerHealth.cricinfo = { ok: false, error: String(e.message), timestamp: Date.now() };
+    throw e;
+  }
+}
 
 // ── Provider: Stake (GraphQL) ───────────────────────────────────────────────
 // Stake is the one source that returns real decimal odds in the SAME response
@@ -860,56 +1223,125 @@ function reddyEventToHukamMatch(event) {
   };
 }
 
-// ── Smart provider fallback chain ───────────────────────────────────────────
+// Merge cricket ODDS (from OddsAPI) into cricket SCORE matches (from Cricinfo)
+// by fuzzy team-name overlap, so one card can show both a live score and odds.
+// Any odds match that doesn't line up with a score match is kept on its own.
+function mergeCricket(scoreMatches, oddsMatches) {
+  if (!oddsMatches.length) return scoreMatches;
+  if (!scoreMatches.length) return oddsMatches;
+
+  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z]/g, "");
+  const teamsOverlap = (a, b) => {
+    const a1 = norm(a.teamA.name), a2 = norm(a.teamB.name);
+    const b1 = norm(b.teamA.name), b2 = norm(b.teamB.name);
+    const hit = (x, y) => x && y && (x.includes(y) || y.includes(x));
+    return (hit(a1, b1) && hit(a2, b2)) || (hit(a1, b2) && hit(a2, b1));
+  };
+
+  const usedOdds = new Set();
+  const out = scoreMatches.map(sm => {
+    const om = oddsMatches.find((o, i) => !usedOdds.has(i) && teamsOverlap(sm, o));
+    if (om) {
+      usedOdds.add(oddsMatches.indexOf(om));
+      // Keep Cricinfo's live score + team names, graft OddsAPI's odds on top.
+      return {
+        ...sm,
+        oddsAvailable: om.oddsAvailable,
+        back: om.back, lay: om.lay, backB: om.backB, layB: om.layB,
+        draw: om.draw, markets: om.markets,
+      };
+    }
+    return sm;
+  });
+
+  // Append odds-only matches that had no score counterpart.
+  oddsMatches.forEach((o, i) => { if (!usedOdds.has(i)) out.push(o); });
+  return out;
+}
+
+// ── Aggregator: merge multiple sources into one board ───────────────────────
+// Strategy:
+//   PRIMARY (all merged): ESPN (football/tennis + real odds) + Cricinfo (cricket
+//     scores) + OddsAPI (cricket odds). Cricket odds are merged INTO cricket-score
+//     matches by team-name match, so a cricket card can show both score and odds.
+//   FALLBACK (first that works): Stake → exchanges → LiveScore, only used if the
+//     primary group returns nothing at all (e.g. total network failure).
 async function refreshCache() {
   if (cache.refreshing) return cache.refreshing;
-  
+
   cache.refreshing = (async () => {
-    // Order matters: providers that return clean team-vs-team data WITH real
-    // odds come first, then real-score providers, then score-only as last resort.
-    //   1. Stake     — real teams + real decimal odds (same call) → best for a board
-    //   2. SofaScore — real teams + real live scores, correct sport detection
-    //   3. Reddy66   — real teams + real BetFair odds (when IP allows)
-    //   4. ReddyBook — real teams + real odds/scores (when reachable)
-    //   5. LiveScore — real teams, score-only, last resort
-    // (FanCode removed: it returns streaming/broadcast metadata — feed names,
-    //  venues, "Day 2" — not clean team-vs-team match data, so it looked wrong.)
-    const providers = [
-      { name: "Stake", fetch: fetchFromStake },
-      { name: "SofaScore", fetch: fetchFromSofaScore },
-      { name: "Reddy66", fetch: fetchFromReddy66 },
-      { name: "ReddyBook", fetch: fetchFromReddyBook },
-      { name: "LiveScore", fetch: fetchFromLiveScore },
-    ];
-    
     let matches = [];
-    let successfulProvider = null;
-    
-    for (const provider of providers) {
-      try {
-        console.log(`[refresh] Trying ${provider.name}...`);
-        const result = await provider.fetch();
-        if (result.length > 0) {
-          matches = result;
-          successfulProvider = provider.name;
-          console.log(`[refresh] ✓ ${provider.name} returned ${result.length} matches`);
-          break;
-        }
-      } catch (e) {
-        console.warn(`[refresh] ✗ ${provider.name} failed:`, e.message);
+    const usedSources = [];
+
+    // ---- PRIMARY GROUP: run in parallel, merge everything that succeeds ----
+    const primary = [
+      { name: "ESPN", fetch: fetchFromESPN },        // football/tennis + odds
+      { name: "Cricinfo", fetch: fetchFromCricinfo },// cricket scores
+      { name: "OddsAPI", fetch: fetchFromOddsAPI },  // cricket odds (keyed)
+    ];
+    const settled = await Promise.allSettled(primary.map(async p => {
+      console.log(`[refresh] Trying ${p.name}...`);
+      const r = await p.fetch();
+      console.log(`[refresh] ✓ ${p.name} → ${r.length}`);
+      return { name: p.name, matches: r };
+    }));
+
+    let espnMatches = [], cricketScores = [], cricketOdds = [];
+    for (const s of settled) {
+      if (s.status === "fulfilled") {
+        usedSources.push(s.value.name);
+        if (s.value.name === "ESPN") espnMatches = s.value.matches;
+        else if (s.value.name === "Cricinfo") cricketScores = s.value.matches;
+        else if (s.value.name === "OddsAPI") cricketOdds = s.value.matches;
+      } else {
+        console.warn(`[refresh] ✗ primary failed:`, s.reason?.message || s.reason);
       }
     }
-    
+
+    // Merge cricket odds INTO cricket score matches (match by team-name overlap).
+    const mergedCricket = mergeCricket(cricketScores, cricketOdds);
+    matches = [...espnMatches, ...mergedCricket];
+
+    // ---- FALLBACK GROUP: only if primary produced nothing ----
+    if (matches.length === 0) {
+      const fallback = [
+        { name: "Stake", fetch: fetchFromStake },
+        { name: "SofaScore", fetch: fetchFromSofaScore },
+        { name: "Reddy66", fetch: fetchFromReddy66 },
+        { name: "ReddyBook", fetch: fetchFromReddyBook },
+        { name: "LiveScore", fetch: fetchFromLiveScore },
+      ];
+      for (const provider of fallback) {
+        try {
+          console.log(`[refresh] (fallback) Trying ${provider.name}...`);
+          const result = await provider.fetch();
+          if (result.length > 0) {
+            matches = result;
+            usedSources.push(provider.name);
+            console.log(`[refresh] ✓ fallback ${provider.name} → ${result.length}`);
+            break;
+          }
+        } catch (e) {
+          console.warn(`[refresh] ✗ ${provider.name} failed:`, e.message);
+        }
+      }
+    }
+
     if (matches.length > 0) {
-      matches.sort((a, b) => (a.status === "live" ? -1 : 1) - (b.status === "live" ? -1 : 1));
-      cache.matches = matches.slice(0, 12);
+      // Live matches first, then those with odds, then the rest.
+      matches.sort((a, b) => {
+        const liveDiff = (a.status === "live" ? 0 : 1) - (b.status === "live" ? 0 : 1);
+        if (liveDiff !== 0) return liveDiff;
+        return (a.oddsAvailable ? 0 : 1) - (b.oddsAvailable ? 0 : 1);
+      });
+      cache.matches = matches.slice(0, 30);
       cache.fetchedAt = Date.now();
-      cache.provider = successfulProvider;
-      console.log(`[refresh] Cache updated from ${successfulProvider} at ${new Date().toISOString()}`);
+      cache.provider = usedSources.join(" + ") || "none";
+      console.log(`[refresh] Cache updated from [${cache.provider}] — ${cache.matches.length} matches at ${new Date().toISOString()}`);
     } else {
       throw new Error("all providers failed");
     }
-    
+
     return cache.matches;
   })().finally(() => { cache.refreshing = null; });
   
@@ -981,19 +1413,19 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(CFG.PORT, () => {
+  const keyCount = CFG.ODDS_API_KEYS.length;
   console.log("═══════════════════════════════════════════════════════════════");
-  console.log(`HukamBook Backend v2.3 (5-Provider Multi-Source) on http://localhost:${CFG.PORT}`);
+  console.log(`HukamBook Backend v3.0 (Aggregator) on http://localhost:${CFG.PORT}`);
   console.log("═══════════════════════════════════════════════════════════════");
-  console.log("Provider Fallback Chain (in order):");
-  console.log(`  1. Stake (GraphQL) — ${CFG.STAKE_API}`);
-  console.log(`  2. SofaScore (REST) — https://api.sofascore.com/api/v1/sport/{sport}/events/live`);
-  console.log(`  3. Reddy66 (REST) — https://catalog.robuzz.lol/catalog/v2/sports-feed/sports/live-events`);
-  console.log(`  4. ReddyBook (REST) → ${CFG.REDDYBOOK_PRIMARY}`);
-  console.log(`     Fallback → ${CFG.REDDYBOOK_FALLBACK}`);
-  console.log(`  5. LiveScore (REST) — https://prod-cdn-public-api.livescore.com/v1/api/app/live/{sport}/0`);
-  console.log(`Cache TTL: ${CFG.CACHE_TTL_S}s (${CFG.LIVE_CACHE_TTL_S}s live)`);
+  console.log("PRIMARY sources (merged every refresh, cloud-friendly):");
+  console.log(`  • ESPN — football & tennis: real teams, live scores, REAL odds`);
+  console.log(`  • ESPNcricinfo — cricket: real teams + live scores`);
+  console.log(`  • the-odds-api.com — cricket ODDS (${keyCount} key${keyCount === 1 ? "" : "s"} loaded${keyCount === 0 ? " — add ODDS_API_KEYS for cricket odds" : ", 15-min cache, auto-rotate"})`);
+  console.log("FALLBACK (only if all primary sources fail):");
+  console.log(`  • Stake → SofaScore → Reddy66 → ReddyBook → LiveScore`);
+  console.log(`Cache TTL: ${CFG.CACHE_TTL_S}s (${CFG.LIVE_CACHE_TTL_S}s live) | Odds cache: ${CFG.ODDS_CACHE_TTL_S}s`);
   console.log("Endpoints:");
-  console.log(`  GET /api/matches → matches array`);
-  console.log(`  GET /api/health  → provider status`);
+  console.log(`  GET /api/matches → merged matches array`);
+  console.log(`  GET /api/health  → source status + odds-key rotation state`);
   console.log("═══════════════════════════════════════════════════════════════");
 });
